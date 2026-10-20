@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=OpenCode Go Usage
+GenericName=Medidor de uso do OpenCode Go
+Comment=Janela flutuante com o uso Rolling, Weekly e Monthly do OpenCode Go
+Exec=simple-opencode-usage
+Icon=simple-opencode-usage
+Terminal=false
+Categories=Utility;Monitor;
+Keywords=opencode;usage;tokens;quotas;go;
+StartupNotify=false
