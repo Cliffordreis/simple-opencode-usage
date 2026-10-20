@@ -15,6 +15,8 @@ Licença: MIT.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import json
 import os
 import queue
@@ -34,7 +36,7 @@ import tkinter.font as tkfont
 
 APP_ID = "simple-opencode-usage"
 APP_NAME = "OpenCode Go Usage"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 USAGE_URL = "https://opencode.ai/inference/go/v1/usage"
 CONSOLE_URL = "https://opencode.ai/console/go"
@@ -719,6 +721,151 @@ def _demo_payload() -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# Cantos arredondados (máscara XShape; funciona em X11/XWayland)
+# --------------------------------------------------------------------------
+class RoundedWindow:
+    SHAPE_BOUNDING = 0
+    SHAPE_SET = 0
+
+    def __init__(self) -> None:
+        self.x11 = None
+        self.xext = None
+        self.display = None
+        self.failed = False
+
+    def _load(self) -> bool:
+        if self.failed:
+            return False
+        if self.display is not None:
+            return True
+        try:
+            x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+            xext = ctypes.CDLL(ctypes.util.find_library("Xext") or "libXext.so.6")
+            x11.XOpenDisplay.restype = ctypes.c_void_p
+            x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            x11.XCreatePixmap.restype = ctypes.c_ulong
+            x11.XCreatePixmap.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint
+            ]
+            x11.XCreateGC.restype = ctypes.c_void_p
+            x11.XCreateGC.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p]
+            x11.XSetForeground.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+            x11.XFillRectangle.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint,
+            ]
+            x11.XFillArc.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint,
+                ctypes.c_int, ctypes.c_int,
+            ]
+            x11.XFreeGC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            x11.XFreePixmap.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            x11.XFree.argtypes = [ctypes.c_void_p]
+            x11.XQueryTree.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+                ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)),
+                ctypes.POINTER(ctypes.c_uint),
+            ]
+            x11.XQueryTree.restype = ctypes.c_int
+            x11.XFlush.argtypes = [ctypes.c_void_p]
+            x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+            xext.XShapeCombineMask.restype = None
+            xext.XShapeCombineMask.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, ctypes.c_ulong, ctypes.c_int,
+            ]
+            display = x11.XOpenDisplay(None)
+            if not display:
+                self.failed = True
+                return False
+        except (OSError, AttributeError):
+            self.failed = True
+            return False
+        self.x11, self.xext, self.display = x11, xext, display
+        return True
+
+    def outer_window(self, window_id: int) -> int:
+        """Sobe até o ancestral imediatamente abaixo da raiz (o wrapper do Tk)."""
+        if not self._load():
+            return window_id
+        assert self.x11 is not None and self.display is not None
+        display = self.display
+        current = int(window_id)
+        root_ret = ctypes.c_ulong()
+        parent_ret = ctypes.c_ulong()
+        count = ctypes.c_uint()
+        for _ in range(16):
+            children = ctypes.POINTER(ctypes.c_ulong)()
+            ok = self.x11.XQueryTree(
+                display,
+                ctypes.c_ulong(current),
+                ctypes.byref(root_ret),
+                ctypes.byref(parent_ret),
+                ctypes.byref(children),
+                ctypes.byref(count),
+            )
+            if not ok:
+                break
+            if children:
+                self.x11.XFree(children)
+            parent = int(parent_ret.value)
+            if parent == 0 or parent == int(root_ret.value):
+                break
+            current = parent
+        return current
+
+    def apply(self, window_id: int, width: int, height: int, radius: int) -> bool:
+        if width <= 1 or height <= 1 or not self._load():
+            return False
+        assert self.x11 is not None and self.xext is not None and self.display is not None
+        display = self.display
+        window = ctypes.c_ulong(window_id)
+        pixmap = self.x11.XCreatePixmap(display, window, width, height, 1)
+        if not pixmap:
+            return False
+        gc = self.x11.XCreateGC(display, pixmap, 0, None)
+        if not gc:
+            self.x11.XFreePixmap(display, pixmap)
+            return False
+        try:
+            r = max(0, min(int(radius), width // 2, height // 2))
+            self.x11.XSetForeground(display, gc, 0)
+            self.x11.XFillRectangle(display, pixmap, gc, 0, 0, width, height)
+            self.x11.XSetForeground(display, gc, 1)
+            if r > 0:
+                self.x11.XFillRectangle(display, pixmap, gc, r, 0, width - 2 * r, height)
+                self.x11.XFillRectangle(display, pixmap, gc, 0, r, width, height - 2 * r)
+                full = 360 * 64
+                self.x11.XFillArc(display, pixmap, gc, 0, 0, 2 * r, 2 * r, 0, full)
+                self.x11.XFillArc(display, pixmap, gc, width - 2 * r, 0, 2 * r, 2 * r, 0, full)
+                self.x11.XFillArc(display, pixmap, gc, 0, height - 2 * r, 2 * r, 2 * r, 0, full)
+                self.x11.XFillArc(
+                    display, pixmap, gc, width - 2 * r, height - 2 * r, 2 * r, 2 * r, 0, full
+                )
+            else:
+                self.x11.XFillRectangle(display, pixmap, gc, 0, 0, width, height)
+            self.xext.XShapeCombineMask(
+                display, window, self.SHAPE_BOUNDING, 0, 0, pixmap, self.SHAPE_SET
+            )
+            self.x11.XFlush(display)
+            return True
+        except Exception:
+            return False
+        finally:
+            self.x11.XFreeGC(display, gc)
+            self.x11.XFreePixmap(display, pixmap)
+
+    def close(self) -> None:
+        if self.display is not None:
+            try:
+                self.x11.XCloseDisplay(self.display)
+            except Exception:
+                pass
+            self.display = None
+
+
+# --------------------------------------------------------------------------
 # Interface principal
 # --------------------------------------------------------------------------
 class App:
@@ -745,6 +892,7 @@ class App:
         self.last_update: Optional[float] = None
         self.usage: dict[str, Any] = {}
         self.settings_window: Optional["SettingsWindow"] = None
+        self.shaper = RoundedWindow()
         self._quit = False
         self._drag = None
 
@@ -829,13 +977,50 @@ class App:
             self._draw_compact()
         else:
             self._draw_card()
+        self.root.update_idletasks()
+        width = self.root.winfo_width()
+        height = self.root.winfo_height()
+        if width <= 1 or height <= 1:
+            width, height = self._scaled_dims()
+        radius = height // 2 if self.compact else self._card_radius()
+        target = self._shape_target()
+        self.shaper.apply(target, width, height, radius)
+
+    def _shape_target(self) -> int:
+        return self.shaper.outer_window(self.root.winfo_id())
+
+    def _card_radius(self) -> int:
+        return max(8, int(round(18 * self.scale)))
+
+    def _draw_shell(self, w: int, h: int) -> None:
+        """Fundo cheio + borda acompanhando os cantos arredondados."""
+        self.canvas.create_rectangle(0, 0, w, h, fill=C["bg"], outline="")
+        radius = h // 2 if self.compact else self._card_radius()
+        r = max(0, radius - 1)
+        if r <= 0:
+            self.canvas.create_rectangle(1, 1, w - 1, h - 1, outline=C["border"])
+            return
+        b = C["border"]
+        self.canvas.create_line(r, 1, w - r, 1, fill=b)
+        self.canvas.create_line(r, h - 1, w - r, h - 1, fill=b)
+        self.canvas.create_line(1, r, 1, h - r, fill=b)
+        self.canvas.create_line(w - 1, r, w - 1, h - r, fill=b)
+        self.canvas.create_arc(1, 1, 1 + 2 * r, 1 + 2 * r, start=90, extent=90, style="arc", outline=b)
+        self.canvas.create_arc(
+            w - 1 - 2 * r, 1, w - 1, 1 + 2 * r, start=0, extent=90, style="arc", outline=b
+        )
+        self.canvas.create_arc(
+            w - 1 - 2 * r, h - 1 - 2 * r, w - 1, h - 1, start=270, extent=90, style="arc", outline=b
+        )
+        self.canvas.create_arc(
+            1, h - 1 - 2 * r, 1 + 2 * r, h - 1, start=180, extent=90, style="arc", outline=b
+        )
 
     def _draw_card(self) -> None:
         w, h = self._scaled_dims()
         S = self._S
         self.canvas.configure(width=w, height=h)
-        self.canvas.create_rectangle(1, 1, w - 1, h - 1, fill=C["bg"], outline=C["border"], width=1)
-        self.canvas.create_rectangle(1, 1, w - 1, S(30), fill=C["bg"], outline="")
+        self._draw_shell(w, h)
         self.canvas.create_text(S(16), S(17), anchor="w", text="OpenCode Go", fill=C["fg"], font=self.font_title)
         self.canvas.create_text(
             S(16), S(33), anchor="w", text="medidores de uso", fill=C["dim"], font=self.font_small
@@ -899,7 +1084,7 @@ class App:
     def _draw_compact(self) -> None:
         w, h = self._scaled_dims()
         self.canvas.configure(width=w, height=h)
-        self.canvas.create_rectangle(1, 1, w - 1, h - 1, fill=C["bg"], outline=C["border"], width=1)
+        self._draw_shell(w, h)
         rolling = (self.usage.get("rolling") or {}).get("percent")
         weekly = (self.usage.get("weekly") or {}).get("percent")
         monthly = (self.usage.get("monthly") or {}).get("percent")
@@ -917,10 +1102,7 @@ class App:
         }
 
     def _refresh(self) -> None:
-        self.canvas.configure(bg=C["bg"])
-        if not self.compact:
-            self._draw()
-        elif self.visible:
+        if self.visible:
             self._draw()
 
     # -- eventos de ponteiro ----------------------------------------------
@@ -1010,12 +1192,12 @@ class App:
             self.compact = False
             self._build_fonts()
             self.root.geometry(self._geometry(*self._scaled_dims()))
-            self._draw()
         self.visible = True
         try:
             self.root.deiconify()
         except tk.TclError:
             pass
+        self._draw()
         self.root.lift()
         self.tray_commands.put(("set_visible", True))
 
@@ -1112,6 +1294,7 @@ class App:
             self.root.destroy()
         except tk.TclError:
             pass
+        self.shaper.close()
 
     # -- configurações -----------------------------------------------------
     def open_settings(self) -> None:

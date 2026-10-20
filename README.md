@@ -34,7 +34,7 @@ Baixe o pacote mais recente em
 <https://github.com/Cliffordreis/simple-opencode-usage/releases/latest> e instale:
 
 ```bash
-sudo apt install ./simple-opencode-usage_1.0.0_all.deb
+sudo apt install ./simple-opencode-usage_1.0.1_all.deb
 ```
 
 O `apt` instala as dependências (`python3-tk`, `python3-gi`). O aplicativo
@@ -44,7 +44,7 @@ Para gerar o pacote a partir do código:
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./dist/simple-opencode-usage_1.0.0_all.deb
+sudo apt install ./dist/simple-opencode-usage_1.0.1_all.deb
 ```
 
 ## Rodar sem instalar
