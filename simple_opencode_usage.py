@@ -18,6 +18,7 @@ import argparse
 import ctypes
 import ctypes.util
 import json
+import math
 import os
 import queue
 import signal
@@ -36,7 +37,7 @@ import tkinter.font as tkfont
 
 APP_ID = "simple-opencode-usage"
 APP_NAME = "OpenCode Go Usage"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 USAGE_URL = "https://opencode.ai/inference/go/v1/usage"
 CONSOLE_URL = "https://opencode.ai/console/go"
@@ -107,6 +108,16 @@ class Config:
         self.data["scale"] = _clamp(_num(self.data.get("scale"), 1.0), 0.8, 1.6)
         self.data["opacity"] = _clamp(_num(self.data.get("opacity"), 0.96), 0.3, 1.0)
         self.data["interval"] = int(_clamp(_num(self.data.get("interval"), 30), 10, 300))
+        self._tighten_permissions()
+
+    def _tighten_permissions(self) -> None:
+        """O config pode conter a chave de API: deixa diretório e arquivo privados."""
+        for target, mode in ((CONFIG_DIR, 0o700), (CONFIG_PATH, 0o600)):
+            try:
+                if target.exists():
+                    os.chmod(target, mode)
+            except OSError:
+                pass
 
     def save(self) -> None:
         payload = dict(self.data)
@@ -114,8 +125,13 @@ class Config:
             payload.pop("api_key", None)
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            os.chmod(CONFIG_DIR, 0o700)
+        except OSError:
+            pass
+        try:
             tmp = CONFIG_PATH.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.chmod(tmp, 0o600)
             tmp.replace(CONFIG_PATH)
         except OSError:
             pass
@@ -237,17 +253,16 @@ def _parse_iso(text: Any) -> Optional[datetime]:
 def fmt_reset(moment: Optional[datetime]) -> str:
     if moment is None:
         return "—"
-    seconds = int((moment - datetime.now(timezone.utc)).total_seconds())
-    if seconds <= 0:
+    seconds = (moment - datetime.now(timezone.utc)).total_seconds()
+    # O console arredonda para cima no minuto seguinte antes de montar o rótulo;
+    # truncar aqui fazia o contador ficar um minuto/hora atrás do site.
+    minutes = max(0, math.ceil(seconds / 60.0))
+    if minutes <= 0:
         return "agora"
-    days, rem = divmod(seconds, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes = rem // 60
-    if days:
-        return f"{days}d {hours}h"
-    if hours:
-        return f"{hours}h {minutes:02d}min"
-    return f"{minutes}min"
+    hours = minutes // 60
+    if hours >= 24:
+        return f"{hours // 24}d {hours % 24}h"
+    return f"{hours}h {minutes % 60:02d}min"
 
 
 def bar_color(percent: Optional[int]) -> str:
@@ -723,6 +738,28 @@ def _demo_payload() -> dict[str, Any]:
 # --------------------------------------------------------------------------
 # Cantos arredondados (máscara XShape; funciona em X11/XWayland)
 # --------------------------------------------------------------------------
+CLIENT_MESSAGE = 33
+SUBSTRUCTURE_REDIRECT = 1 << 20
+SUBSTRUCTURE_NOTIFY = 1 << 19
+
+
+class _XClientMessageEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("message_type", ctypes.c_ulong),
+        ("format", ctypes.c_int),
+        ("data", ctypes.c_long * 5),
+    ]
+
+
+class _XEvent(ctypes.Union):
+    _fields_ = [("xclient", _XClientMessageEvent), ("pad", ctypes.c_long * 24)]
+
+
 class RoundedWindow:
     SHAPE_BOUNDING = 0
     SHAPE_SET = 0
@@ -770,6 +807,14 @@ class RoundedWindow:
             x11.XQueryTree.restype = ctypes.c_int
             x11.XFlush.argtypes = [ctypes.c_void_p]
             x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+            x11.XDefaultRootWindow.restype = ctypes.c_ulong
+            x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+            x11.XInternAtom.restype = ctypes.c_ulong
+            x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+            x11.XSendEvent.argtypes = [
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_long, ctypes.c_void_p
+            ]
+            x11.XSendEvent.restype = ctypes.c_int
             xext.XShapeCombineMask.restype = None
             xext.XShapeCombineMask.argtypes = [
                 ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int,
@@ -814,6 +859,70 @@ class RoundedWindow:
                 break
             current = parent
         return current
+
+    def parent_window(self, window_id: int) -> int:
+        """Retorna o wrapper imediatamente acima da janela Tk (o cliente do WM)."""
+        if not self._load():
+            return window_id
+        assert self.x11 is not None and self.display is not None
+        root_ret = ctypes.c_ulong()
+        parent_ret = ctypes.c_ulong()
+        count = ctypes.c_uint()
+        children = ctypes.POINTER(ctypes.c_ulong)()
+        ok = self.x11.XQueryTree(
+            self.display,
+            ctypes.c_ulong(int(window_id)),
+            ctypes.byref(root_ret),
+            ctypes.byref(parent_ret),
+            ctypes.byref(children),
+            ctypes.byref(count),
+        )
+        if children:
+            self.x11.XFree(children)
+        if not ok:
+            return window_id
+        parent = int(parent_ret.value)
+        if parent in (0, int(root_ret.value)):
+            return window_id
+        return parent
+
+    def activate(self, window_id: int) -> bool:
+        """Pede ao WM (EWMH) para ativar a janela, trocando de workspace se preciso.
+
+        `lift()`/`focus_force()` do Tk não desminimizam nem trazem uma janela
+        que ficou em outro workspace; sem isso a janela de configurações podia
+        ficar inacessível depois de minimizada.
+        """
+        if not self._load():
+            return False
+        assert self.x11 is not None and self.display is not None
+        display = self.display
+        # winfo_id() é a janela interna do Tk; o cliente gerenciado pelo WM é
+        # o wrapper imediatamente acima (o mesmo motivo pelo qual o XShape
+        # precisa subir um nível). _NET_ACTIVE_WINDOW espera o cliente.
+        target = self.parent_window(window_id)
+        atom = self.x11.XInternAtom(display, b"_NET_ACTIVE_WINDOW", 0)
+        if not atom:
+            return False
+        event = _XEvent()
+        event.xclient.type = CLIENT_MESSAGE
+        event.xclient.send_event = 1
+        event.xclient.display = display
+        event.xclient.window = target
+        event.xclient.message_type = atom
+        event.xclient.format = 32
+        event.xclient.data[0] = 1  # origem "aplicação"
+        event.xclient.data[1] = 0
+        event.xclient.data[2] = 0
+        self.x11.XSendEvent(
+            display,
+            self.x11.XDefaultRootWindow(display),
+            0,
+            SUBSTRUCTURE_REDIRECT | SUBSTRUCTURE_NOTIFY,
+            ctypes.byref(event),
+        )
+        self.x11.XFlush(display)
+        return True
 
     def apply(self, window_id: int, width: int, height: int, radius: int) -> bool:
         if width <= 1 or height <= 1 or not self._load():
@@ -1298,8 +1407,8 @@ class App:
 
     # -- configurações -----------------------------------------------------
     def open_settings(self) -> None:
-        if self.settings_window is not None and self.settings_window.alive:
-            self.settings_window.focus()
+        window = self.settings_window
+        if window is not None and window.alive and window.reveal():
             return
         self.settings_window = SettingsWindow(self)
 
@@ -1563,6 +1672,7 @@ class SettingsWindow:
             x = max(10, min(x, app.root.winfo_screenwidth() - width - 20))
         y = app.root.winfo_y()
         top.geometry(f"+{x}+{max(10, y)}")
+        top.after(60, self.reveal)
         top.after(200, lambda: self._poll_test())
 
     # -- ações -------------------------------------------------------------
@@ -1638,9 +1748,29 @@ class SettingsWindow:
         except tk.TclError:
             pass
 
+    def reveal(self) -> bool:
+        """Desminimiza e traz a janela para a frente; False se ela não existe mais."""
+        if not self.alive:
+            return False
+        try:
+            if not self.top.winfo_exists():
+                self.alive = False
+                return False
+            self.top.deiconify()
+            self.top.lift()
+            try:
+                self.top.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            self.app.shaper.activate(self.top.winfo_id())
+            self.top.focus_force()
+            return True
+        except tk.TclError:
+            self.alive = False
+            return False
+
     def focus(self) -> None:
-        self.top.lift()
-        self.top.focus_force()
+        self.reveal()
 
     def close(self) -> None:
         try:

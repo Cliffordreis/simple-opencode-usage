@@ -34,7 +34,7 @@ Baixe o pacote mais recente em
 <https://github.com/Cliffordreis/simple-opencode-usage/releases/latest> e instale:
 
 ```bash
-sudo apt install ./simple-opencode-usage_1.0.1_all.deb
+sudo apt install ./simple-opencode-usage_1.0.2_all.deb
 ```
 
 O `apt` instala as dependências (`python3-tk`, `python3-gi`). O aplicativo
@@ -44,7 +44,7 @@ Para gerar o pacote a partir do código:
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./dist/simple-opencode-usage_1.0.1_all.deb
+sudo apt install ./dist/simple-opencode-usage_1.0.2_all.deb
 ```
 
 ## Rodar sem instalar
@@ -153,6 +153,10 @@ rm -f ~/.config/autostart/simple-opencode-usage.desktop
 - O endpoint de uso (`/inference/go/v1/usage`) é o mesmo usado pelo console web
   do OpenCode; ele não é documentado publicamente e pode mudar. O widget mostra
   o erro em vez de inventar dados.
+- A API oficial informa a porcentagem em números inteiros; o console calcula
+  com microcentavos e arredonda para cima, então o cartão pode ficar até 1 ponto
+  abaixo do site. Os horários de reset seguem a mesma regra do console
+  (arredondados para o próximo minuto).
 - O ícone da bandeja usa StatusNotifierItem; no GNOME é necessária a extensão
   AppIndicator (já presente no Zorin/Ubuntu).
 - Testado em Zorin OS (GNOME/Wayland com XWayland) e X11.
